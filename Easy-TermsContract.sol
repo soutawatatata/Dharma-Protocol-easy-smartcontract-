@@ -1,67 +1,242 @@
-
 pragma solidity 0.4.18;
 
+// Internal dependencies.
+import "./DebtRegistry.sol";
+import "./ERC165.sol";
+import { PermissionsLib, PermissionEvents } from "./libraries/PermissionsLib.sol";
 
-interface TermsContract {
-     /// When called, the registerTermStart function registers the fact that
-     ///    the debt agreement has begun.  This method is called as a hook by the
-     ///    DebtKernel when a debt order associated with `agreementId` is filled.
-     ///    Method is not required to make any sort of internal state change
-     ///    upon the debt agreement's start, but MUST return `true` in order to
-     ///    acknowledge receipt of the transaction.  If, for any reason, the
-     ///    debt agreement stored at `agreementId` is incompatible with this contract,
-     ///    MUST return `false`, which will cause the pertinent order fill to fail.
-     ///    If this method is called for a debt agreement whose term has already begun,
-     ///    must THROW.  Similarly, if this method is called by any contract other
-     ///    than the current DebtKernel, must THROW.
-     /// @param  agreementId bytes32. The agreement id (issuance hash) of the debt agreement to which this pertains.
-     /// @param  debtor address. The debtor in this particular issuance.
-     /// @return _success bool. Acknowledgment of whether
-    function registerTermStart(
-        bytes32 agreementId,
-        address debtor
-    ) public returns (bool _success);
+// External dependencies.
+import "zeppelin-solidity/contracts/lifecycle/Pausable.sol";
+import "zeppelin-solidity/contracts/token/ERC721/ERC721Token.sol";
+import "zeppelin-solidity/contracts/token/ERC20/ERC20.sol";
 
-     /// When called, the registerRepayment function records the debtor's
-     ///  repayment, as well as any auxiliary metadata needed by the contract
-     ///  to determine ex post facto the value repaid (e.g. current USD
-     ///  exchange rate)
-     /// @param  agreementId bytes32. The agreement id (issuance hash) of the debt agreement to which this pertains.
-     /// @param  payer address. The address of the payer.
-     /// @param  beneficiary address. The address of the payment's beneficiary.
-     /// @param  unitsOfRepayment uint. The units-of-value repaid in the transaction.
-     /// @param  tokenAddress address. The address of the token with which the repayment transaction was executed.
-    function registerRepayment(
-        bytes32 agreementId,
-        address payer,
-        address beneficiary,
-        uint256 unitsOfRepayment,
-        address tokenAddress
-    ) public returns (bool _success);
 
-     /// Returns the cumulative units-of-value expected to be repaid by a given block timestamp.
-     ///  Note this is not a constant function -- this value can vary on basis of any number of
-     ///  conditions (e.g. interest rates can be renegotiated if repayments are delinquent).
-     /// @param  agreementId bytes32. The agreement id (issuance hash) of the debt agreement to which this pertains.
-     /// @param  timestamp uint. The timestamp of the block for which repayment expectation is being queried.
-     /// @return uint256 The cumulative units-of-value expected to be repaid by the time the given timestamp lapses.
-    function getExpectedRepaymentValue(
-        bytes32 agreementId,
-        uint256 timestamp
-    ) public view returns (uint256);
+/**
+ * The DebtToken contract governs all business logic for making a debt agreement
+ * transferable as an ERC721 non-fungible token.  Additionally, the contract
+ * allows authorized contracts to trigger the minting of a debt agreement token
+ * and, in turn, the insertion of a debt issuance into the DebtRegsitry.
+ *
+ * Author: Nadav Hollander -- Github: nadavhollander
+ */
+contract DebtToken is ERC721Token, ERC165, Pausable, PermissionEvents {
+    using PermissionsLib for PermissionsLib.Permissions;
 
-     /// Returns the cumulative units-of-value repaid by the point at which this method is called.
-     /// @param  agreementId bytes32. The agreement id (issuance hash) of the debt agreement to which this pertains.
-     /// @return uint256 The cumulative units-of-value repaid up until now.
-    function getValueRepaidToDate(
-        bytes32 agreementId
-    ) public view returns (uint256);
+    DebtRegistry public registry;
+
+    PermissionsLib.Permissions internal tokenCreationPermissions;
+    PermissionsLib.Permissions internal tokenURIPermissions;
+
+    string public constant CREATION_CONTEXT = "debt-token-creation";
+    string public constant URI_CONTEXT = "debt-token-uri";
 
     /**
-     * A method that returns a Unix timestamp representing the end of the debt agreement's term.
-     * contract.
+     * Constructor that sets the address of the debt registry.
      */
-    function getTermEndTimestamp(
-        bytes32 _agreementId
-    ) public view returns (uint);
+    function DebtToken(address _registry)
+        public
+        ERC721Token("DebtToken", "DDT")
+    {
+        registry = DebtRegistry(_registry);
+    }
+
+    /**
+     * ERC165 interface.
+     * Returns true for ERC721, false otherwise
+     */
+    function supportsInterface(bytes4 interfaceID)
+        external
+        view
+        returns (bool _isSupported)
+    {
+        return interfaceID == 0x80ac58cd; // ERC721
+    }
+
+    /**
+     * Mints a unique debt token and inserts the associated issuance into
+     * the debt registry, if the calling address is authorized to do so.
+     */
+    function create(
+        address _version,
+        address _beneficiary,
+        address _debtor,
+        address _underwriter,
+        uint _underwriterRiskRating,
+        address _termsContract,
+        bytes32 _termsContractParameters,
+        uint _salt
+    )
+        public
+        whenNotPaused
+        returns (uint _tokenId)
+    {
+        require(tokenCreationPermissions.isAuthorized(msg.sender));
+
+        bytes32 entryHash = registry.insert(
+            _version,
+            _beneficiary,
+            _debtor,
+            _underwriter,
+            _underwriterRiskRating,
+            _termsContract,
+            _termsContractParameters,
+            _salt
+        );
+
+        super._mint(_beneficiary, uint(entryHash));
+
+        return uint(entryHash);
+    }
+
+    /**
+     * Adds an address to the list of agents authorized to mint debt tokens.
+     */
+    function addAuthorizedMintAgent(address _agent)
+        public
+        onlyOwner
+    {
+        tokenCreationPermissions.authorize(_agent, CREATION_CONTEXT);
+    }
+
+    /**
+     * Removes an address from the list of agents authorized to mint debt tokens
+     */
+    function revokeMintAgentAuthorization(address _agent)
+        public
+        onlyOwner
+    {
+        tokenCreationPermissions.revokeAuthorization(_agent, CREATION_CONTEXT);
+    }
+
+    /**
+     * Returns the list of agents authorized to mint debt tokens
+     */
+    function getAuthorizedMintAgents()
+        public
+        view
+        returns (address[] _agents)
+    {
+        return tokenCreationPermissions.getAuthorizedAgents();
+    }
+
+    /**
+     * Adds an address to the list of agents authorized to set token URIs.
+     */
+    function addAuthorizedTokenURIAgent(address _agent)
+        public
+        onlyOwner
+    {
+        tokenURIPermissions.authorize(_agent, URI_CONTEXT);
+    }
+
+    /**
+     * Returns the list of agents authorized to set token URIs.
+     */
+    function getAuthorizedTokenURIAgents()
+        public
+        view
+        returns (address[] _agents)
+    {
+        return tokenURIPermissions.getAuthorizedAgents();
+    }
+
+    /**
+     * Removes an address from the list of agents authorized to set token URIs.
+     */
+    function revokeTokenURIAuthorization(address _agent)
+        public
+        onlyOwner
+    {
+        tokenURIPermissions.revokeAuthorization(_agent, URI_CONTEXT);
+    }
+
+    /**
+     * We override approval method of the parent ERC721Token
+     * contract to allow its functionality to be frozen in the case of an emergency
+     */
+    function approve(address _to, uint _tokenId)
+        public
+        whenNotPaused
+    {
+        super.approve(_to, _tokenId);
+    }
+
+    /**
+     * We override setApprovalForAll method of the parent ERC721Token
+     * contract to allow its functionality to be frozen in the case of an emergency
+     */
+    function setApprovalForAll(address _to, bool _approved)
+        public
+        whenNotPaused
+    {
+        super.setApprovalForAll(_to, _approved);
+    }
+
+    /**
+     * Support deprecated ERC721 method
+     */
+    function transfer(address _to, uint _tokenId)
+        public
+    {
+        safeTransferFrom(msg.sender, _to, _tokenId);
+    }
+
+    /**
+     * We override transferFrom methods of the parent ERC721Token
+     * contract to allow its functionality to be frozen in the case of an emergency
+     */
+    function transferFrom(address _from, address _to, uint _tokenId)
+        public
+        whenNotPaused
+    {
+        _modifyBeneficiary(_tokenId, _to);
+        super.transferFrom(_from, _to, _tokenId);
+    }
+
+    /**
+     * We override safeTransferFrom methods of the parent ERC721Token
+     * contract to allow its functionality to be frozen in the case of an emergency
+     */
+    function safeTransferFrom(address _from, address _to, uint _tokenId)
+        public
+        whenNotPaused
+    {
+        _modifyBeneficiary(_tokenId, _to);
+        super.safeTransferFrom(_from, _to, _tokenId);
+    }
+
+    /**
+     * We override safeTransferFrom methods of the parent ERC721Token
+     * contract to allow its functionality to be frozen in the case of an emergency
+     */
+    function safeTransferFrom(address _from, address _to, uint _tokenId, bytes _data)
+        public
+        whenNotPaused
+    {
+        _modifyBeneficiary(_tokenId, _to);
+        super.safeTransferFrom(_from, _to, _tokenId, _data);
+    }
+
+    /**
+     * Allows senders with special permissions to set the token URI for a given debt token.
+     */
+    function setTokenURI(uint256 _tokenId, string _uri)
+        public
+        whenNotPaused
+    {
+        require(tokenURIPermissions.isAuthorized(msg.sender));
+        super._setTokenURI(_tokenId, _uri);
+    }
+
+    /**
+     * _modifyBeneficiary mutates the debt registry. This function should be
+     * called every time a token is transferred or minted
+     */
+    function _modifyBeneficiary(uint _tokenId, address _to)
+        internal
+    {
+        if (registry.getBeneficiary(bytes32(_tokenId)) != _to) {
+            registry.modifyBeneficiary(bytes32(_tokenId), _to);
+        }
+    }
 }
